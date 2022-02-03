@@ -149,7 +149,7 @@ struct RequestVote {
     /// Candidate's term.
     term: Term,
     /// Candidate which is requesting vote.
-    candidate_id: NodeID,
+    candidate: NodeID,
     /// Index of candidate's last log entry.
     last_log_index: LogIndex,
     /// Term of candidate's last log entry.
@@ -170,9 +170,9 @@ impl<Entry> RaftState<Entry> {
                 term: self.current_term,
                 vote_granted: false,
             }
-        } else if self.voted_for.is_none() || self.voted_for == Some(request_vote.candidate_id) {
+        } else if self.voted_for.is_none() || self.voted_for == Some(request_vote.candidate) {
             self.current_term = request_vote.term;
-            self.voted_for = Some(request_vote.candidate_id);
+            self.voted_for = Some(request_vote.candidate);
             RequestVoteResponse {
                 term: self.current_term,
                 vote_granted: true,
@@ -193,6 +193,17 @@ enum Rpc<Entry> {
     RequestVoteResponse(RequestVoteResponse),
 }
 
+impl<Entry> Rpc<Entry> {
+    fn term(&self) -> Term {
+        match self {
+            Rpc::AppendEntries(append_entries) => append_entries.term,
+            Rpc::AppendEntriesResponse(append_entries_response) => append_entries_response.term,
+            Rpc::RequestVote(request_vote) => request_vote.term,
+            Rpc::RequestVoteResponse(request_vote_response) => request_vote_response.term,
+        }
+    }
+}
+
 trait Context<Entry> {
     type RecvError: Debug;
     type RecoveryError: Debug;
@@ -200,7 +211,8 @@ trait Context<Entry> {
     fn send(&mut self, rpc: Rpc<Entry>, to: NodeID);
     fn broadcast(&mut self, rpc: Rpc<Entry>);
     fn receive(&mut self, timeout: Duration) -> Result<Rpc<Entry>, Self::RecvError>;
-    fn save(&mut self, state: RaftState<Entry>);
+    fn receive_until(&mut self, timeout: Duration) -> Result<Vec<Rpc<Entry>>, Self::RecvError>;
+    fn save(&mut self, state: &RaftState<Entry>);
     fn recover(&mut self) -> Result<RaftState<Entry>, Self::RecoveryError>;
     fn timeout(&self) -> Duration;
     fn my_id(&self) -> NodeID;
@@ -224,11 +236,54 @@ fn run<Entry, Ctx: Context<Entry>>(mut ctx: Ctx) -> Result<!, RaftError<Ctx, Ent
     let mut state = ctx.recover().map_err(RaftError::RecoveryError)?;
     let mut role = ProtocolRole::Follower;
     let mut votes = BTreeSet::new();
+
+    fn become_candidate<Entry, Ctx: Context<Entry>>(
+        ctx: &mut Ctx,
+        state: &mut RaftState<Entry>,
+        role: &mut ProtocolRole,
+        votes: &mut BTreeSet<NodeID>,
+    ) {
+        *role = ProtocolRole::Candidate;
+        state.current_term.increment();
+        votes.insert(ctx.my_id());
+        ctx.broadcast(Rpc::RequestVote(RequestVote {
+            term: state.current_term,
+            candidate: ctx.my_id(),
+            last_log_index: state.log.commit_index,
+            last_log_term: state.log[state.log.commit_index].0,
+        }));
+    }
+
+    fn respond_as_follower<Entry, Ctx: Context<Entry>>(
+        ctx: &mut Ctx,
+        state: &mut RaftState<Entry>,
+        msg: Rpc<Entry>,
+    ) {
+        match msg {
+            Rpc::AppendEntries(append_entries) => {
+                let from = append_entries.leader;
+                let response = state.append_entries(append_entries);
+                ctx.save(&state);
+                ctx.send(Rpc::AppendEntriesResponse(response), from);
+            }
+            Rpc::RequestVote(request_vote) => {
+                let from = request_vote.candidate;
+                let response = state.request_vote(request_vote);
+                ctx.save(&state);
+                ctx.send(Rpc::RequestVoteResponse(response), from);
+            }
+            Rpc::RequestVoteResponse(_) => {} // Nothing to do, ignore
+            Rpc::AppendEntriesResponse(_) => {} // Nothing to do, ignore
+        }
+    }
+
     loop {
         match role {
             ProtocolRole::Leader => todo!(),
             ProtocolRole::Candidate => match ctx.receive(ctx.timeout()) {
-                Err(_recv_err) => todo!(),
+                Err(_recv_err) => {
+                    become_candidate(&mut ctx, &mut state, &mut role, &mut votes);
+                }
                 Ok(msg) => match msg {
                     Rpc::AppendEntries(_) => todo!(),
                     Rpc::AppendEntriesResponse(_) => todo!(),
@@ -241,25 +296,9 @@ fn run<Entry, Ctx: Context<Entry>>(mut ctx: Ctx) -> Result<!, RaftError<Ctx, Ent
                 // candidate if we don't get a message.
                 match ctx.receive(ctx.timeout()) {
                     Err(_recv_err) => {
-                        // Didn't receive a message, converting to candidate.
-                        role = ProtocolRole::Candidate;
-                        // Increment our current term so others will vote for us.
-                        state.current_term.increment();
-                        // TODO
-                        votes.insert(ctx.my_id());
-                        ctx.broadcast(Rpc::RequestVote(RequestVote {
-                            term: state.current_term,
-                            candidate_id: ctx.my_id(),
-                            last_log_index: state.log.commit_index,
-                            last_log_term: state.log[state.log.commit_index].0,
-                        }));
+                        become_candidate(&mut ctx, &mut state, &mut role, &mut votes);
                     }
-                    Ok(msg) => match msg {
-                        Rpc::AppendEntries(_) => todo!(),
-                        Rpc::AppendEntriesResponse(_) => todo!(),
-                        Rpc::RequestVote(_) => todo!(),
-                        Rpc::RequestVoteResponse(_) => todo!(),
-                    },
+                    Ok(msg) => respond_as_follower(&mut ctx, &mut state, msg),
                 }
             }
         }
