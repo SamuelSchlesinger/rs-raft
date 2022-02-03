@@ -1,6 +1,6 @@
 #![feature(never_type)]
 
-use std::{fmt::Debug, ops::Index, time::Duration};
+use std::{collections::BTreeSet, fmt::Debug, ops::Index, time::Duration};
 
 #[derive(Debug, PartialOrd, PartialEq, Eq, Ord, Clone, Copy)]
 struct Term(u64);
@@ -69,14 +69,7 @@ impl<Entry> Log<Entry> {
 }
 
 #[derive(Debug, PartialOrd, PartialEq, Eq, Ord)]
-pub struct Config {
-    id: NodeID,
-}
-
-#[derive(Debug, PartialOrd, PartialEq, Eq, Ord)]
 pub struct RaftState<Entry> {
-    /// Static configuration for this instance of the protocol.
-    config: Config,
     /// Latest term server has seen. Initialized to 0 on first boot,
     /// increases monotonically.
     ///
@@ -210,6 +203,8 @@ trait Context<Entry> {
     fn save(&mut self, state: RaftState<Entry>);
     fn recover(&mut self) -> Result<RaftState<Entry>, Self::RecoveryError>;
     fn timeout(&self) -> Duration;
+    fn my_id(&self) -> NodeID;
+    fn num_participants(&self) -> usize;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -228,10 +223,19 @@ enum RaftError<Ctx: Context<Entry>, Entry> {
 fn run<Entry, Ctx: Context<Entry>>(mut ctx: Ctx) -> Result<!, RaftError<Ctx, Entry>> {
     let mut state = ctx.recover().map_err(RaftError::RecoveryError)?;
     let mut role = ProtocolRole::Follower;
+    let mut votes = BTreeSet::new();
     loop {
         match role {
             ProtocolRole::Leader => todo!(),
-            ProtocolRole::Candidate => todo!(),
+            ProtocolRole::Candidate => match ctx.receive(ctx.timeout()) {
+                Err(_recv_err) => todo!(),
+                Ok(msg) => match msg {
+                    Rpc::AppendEntries(_) => todo!(),
+                    Rpc::AppendEntriesResponse(_) => todo!(),
+                    Rpc::RequestVote(_) => todo!(),
+                    Rpc::RequestVoteResponse(_) => todo!(),
+                },
+            },
             ProtocolRole::Follower => {
                 // Respond to RPCs from candidates and leaders, converting to
                 // candidate if we don't get a message.
@@ -242,6 +246,13 @@ fn run<Entry, Ctx: Context<Entry>>(mut ctx: Ctx) -> Result<!, RaftError<Ctx, Ent
                         // Increment our current term so others will vote for us.
                         state.current_term.increment();
                         // TODO
+                        votes.insert(ctx.my_id());
+                        ctx.broadcast(Rpc::RequestVote(RequestVote {
+                            term: state.current_term,
+                            candidate_id: ctx.my_id(),
+                            last_log_index: state.log.commit_index,
+                            last_log_term: state.log[state.log.commit_index].0,
+                        }));
                     }
                     Ok(msg) => match msg {
                         Rpc::AppendEntries(_) => todo!(),
