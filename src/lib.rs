@@ -1,7 +1,16 @@
-use std::ops::Index;
+#![feature(never_type)]
+
+use std::{fmt::Debug, ops::Index, time::Duration};
 
 #[derive(Debug, PartialOrd, PartialEq, Eq, Ord, Clone, Copy)]
 struct Term(u64);
+
+impl Term {
+    fn increment(&mut self) {
+        let Term(i) = *self;
+        *self = Term(i + 1);
+    }
+}
 
 #[derive(Debug, PartialOrd, PartialEq, Eq, Ord, Clone, Copy)]
 struct NodeID(u64);
@@ -11,7 +20,11 @@ struct LogIndex(u64);
 
 #[derive(Debug, PartialOrd, PartialEq, Eq, Ord, Clone)]
 struct Log<Entry> {
+    /// Entries in the log.
     entries: Vec<(Term, Entry)>,
+    /// Index of highest log entry known to be committed. Initialized to 0,
+    /// increases monotonically,
+    commit_index: LogIndex,
 }
 
 impl<Entry> Index<LogIndex> for Log<Entry> {
@@ -27,8 +40,12 @@ impl<Entry> Log<Entry> {
     fn include_after<I: Iterator<Item = (Term, Entry)>>(
         &mut self,
         prev_index: LogIndex,
+        leader_commit: LogIndex,
         mut entries: I,
     ) {
+        if leader_commit > self.commit_index {
+            self.commit_index = leader_commit;
+        }
         let LogIndex(prev_index) = prev_index;
         let mut i = 1;
         'overwrite_existing_values: loop {
@@ -73,14 +90,8 @@ pub struct RaftState<Entry> {
     ///
     /// Must be persisted for recovery.
     log: Log<Entry>,
-    /// Index of highest log entry known to be committed. Initialized to 0,
-    /// increases monotonically,
-    commit_index: LogIndex,
     /// Index of highest log entry applied to state machine. Initialized to 0,
     /// increases monotonically.
-    last_applied: LogIndex,
-    /// If you're the leader in the current term, you will have leader state as
-    /// well.
     leader: Option<LeaderState>,
 }
 
@@ -127,10 +138,11 @@ impl<Entry> RaftState<Entry> {
             self.current_term = append_entries.term;
             self.log.include_after(
                 append_entries.previous_log_index,
+                append_entries.leader_commit,
                 append_entries.entries.into_iter(),
             );
-            if append_entries.leader_commit > self.commit_index {
-                self.commit_index = append_entries.leader_commit;
+            if append_entries.leader_commit > self.log.commit_index {
+                self.log.commit_index = append_entries.leader_commit;
             }
             AppendEntriesResponse {
                 term: self.current_term,
@@ -176,6 +188,68 @@ impl<Entry> RaftState<Entry> {
             RequestVoteResponse {
                 term: self.current_term,
                 vote_granted: false,
+            }
+        }
+    }
+}
+
+enum Rpc<Entry> {
+    AppendEntries(AppendEntries<Entry>),
+    AppendEntriesResponse(AppendEntriesResponse),
+    RequestVote(RequestVote),
+    RequestVoteResponse(RequestVoteResponse),
+}
+
+trait Context<Entry> {
+    type RecvError: Debug;
+    type RecoveryError: Debug;
+
+    fn send(&mut self, rpc: Rpc<Entry>, to: NodeID);
+    fn broadcast(&mut self, rpc: Rpc<Entry>);
+    fn receive(&mut self, timeout: Duration) -> Result<Rpc<Entry>, Self::RecvError>;
+    fn save(&mut self, state: RaftState<Entry>);
+    fn recover(&mut self) -> Result<RaftState<Entry>, Self::RecoveryError>;
+    fn timeout(&self) -> Duration;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProtocolRole {
+    Leader,
+    Candidate,
+    Follower,
+}
+
+#[derive(Debug)]
+enum RaftError<Ctx: Context<Entry>, Entry> {
+    RecvError(<Ctx as Context<Entry>>::RecvError),
+    RecoveryError(<Ctx as Context<Entry>>::RecoveryError),
+}
+
+fn run<Entry, Ctx: Context<Entry>>(mut ctx: Ctx) -> Result<!, RaftError<Ctx, Entry>> {
+    let mut state = ctx.recover().map_err(RaftError::RecoveryError)?;
+    let mut role = ProtocolRole::Follower;
+    loop {
+        match role {
+            ProtocolRole::Leader => todo!(),
+            ProtocolRole::Candidate => todo!(),
+            ProtocolRole::Follower => {
+                // Respond to RPCs from candidates and leaders, converting to
+                // candidate if we don't get a message.
+                match ctx.receive(ctx.timeout()) {
+                    Err(_recv_err) => {
+                        // Didn't receive a message, converting to candidate.
+                        role = ProtocolRole::Candidate;
+                        // Increment our current term so others will vote for us.
+                        state.current_term.increment();
+                        // TODO
+                    }
+                    Ok(msg) => match msg {
+                        Rpc::AppendEntries(_) => todo!(),
+                        Rpc::AppendEntriesResponse(_) => todo!(),
+                        Rpc::RequestVote(_) => todo!(),
+                        Rpc::RequestVoteResponse(_) => todo!(),
+                    },
+                }
             }
         }
     }
